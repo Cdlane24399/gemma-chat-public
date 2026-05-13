@@ -1,4 +1,5 @@
-import { AVAILABLE_MODELS, type SetupStatus } from '@shared/types'
+import { useEffect, useRef, useState } from 'react'
+import { AVAILABLE_MODELS, isCloudModel, type SetupStatus } from '@shared/types'
 import gemmaLogoUrl from '../assets/gemma-logo.png'
 
 interface Props {
@@ -20,12 +21,50 @@ function formatBytes(n?: number): string {
   return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${u[i]}`
 }
 
+function formatEta(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return ''
+  if (seconds < 60) return `${Math.round(seconds)}s left`
+  const m = Math.floor(seconds / 60)
+  const s = Math.round(seconds % 60)
+  if (m < 60) return `${m}m ${s}s left`
+  const h = Math.floor(m / 60)
+  return `${h}h ${m % 60}m left`
+}
+
+/** Estimate ETA from bytesDone history. */
+function useEta(status: SetupStatus): { etaSeconds: number | null; bps: number | null } {
+  const samplesRef = useRef<Array<{ t: number; bytes: number }>>([])
+  const [tick, setTick] = useState(0)
+  useEffect(() => {
+    if (status.bytesDone == null) return
+    samplesRef.current.push({ t: Date.now(), bytes: status.bytesDone })
+    if (samplesRef.current.length > 12) samplesRef.current.shift()
+    setTick((x) => x + 1)
+  }, [status.bytesDone])
+  if (status.bytesDone == null || status.bytesTotal == null) {
+    return { etaSeconds: null, bps: null }
+  }
+  const samples = samplesRef.current
+  if (samples.length < 2) return { etaSeconds: null, bps: null }
+  const first = samples[0]
+  const last = samples[samples.length - 1]
+  const dt = (last.t - first.t) / 1000
+  const db = last.bytes - first.bytes
+  if (dt <= 0.5 || db <= 0) return { etaSeconds: null, bps: null }
+  const bps = db / dt
+  const remaining = Math.max(0, status.bytesTotal - status.bytesDone)
+  void tick
+  return { etaSeconds: remaining / bps, bps }
+}
+
 export default function Setup({ status, model, onModelChange, onStart }: Props) {
+  const cloudModel = isCloudModel(model)
   const isWorking =
     status.stage === 'checking' ||
     status.stage === 'installing-mlx' ||
     status.stage === 'starting-mlx' ||
     status.stage === 'downloading-model'
+  const { etaSeconds, bps } = useEta(status)
 
   if (status.stage === 'checking' && status.message === 'Welcome') {
     return <WelcomeScreen model={model} onModelChange={onModelChange} onStart={onStart} />
@@ -40,11 +79,13 @@ export default function Setup({ status, model, onModelChange, onStart }: Props) 
             <GemmaLogo className="mx-auto mb-5 h-20 w-20" />
             <h1 className="text-[22px] font-semibold tracking-tight">Setting things up</h1>
             <p className="mt-1.5 text-sm text-ink-400">
-              Everything runs locally. Nothing leaves your Mac.
+              {cloudModel
+                ? 'Connecting to Vercel AI Gateway.'
+                : 'Everything runs locally. Nothing leaves your Mac.'}
             </p>
           </div>
 
-          <StageList status={status} />
+          <StageList status={status} cloudModel={cloudModel} />
 
           {isWorking && status.progress != null && (
             <div className="mt-6">
@@ -56,11 +97,15 @@ export default function Setup({ status, model, onModelChange, onStart }: Props) 
               </div>
               <div className="mt-2 flex justify-between text-[11px] tabular-nums text-ink-400">
                 <span>{Math.round((status.progress ?? 0) * 100)}%</span>
-                {status.bytesDone != null && status.bytesTotal != null && (
-                  <span>
-                    {formatBytes(status.bytesDone)} / {formatBytes(status.bytesTotal)}
-                  </span>
-                )}
+                <span className="flex items-center gap-2">
+                  {bps != null && bps > 0 && <span>{formatBytes(bps)}/s</span>}
+                  {etaSeconds != null && <span>{formatEta(etaSeconds)}</span>}
+                  {status.bytesDone != null && status.bytesTotal != null && (
+                    <span>
+                      {formatBytes(status.bytesDone)} / {formatBytes(status.bytesTotal)}
+                    </span>
+                  )}
+                </span>
               </div>
             </div>
           )}
@@ -93,6 +138,7 @@ function WelcomeScreen({
   onStart: (model: string) => void
 }) {
   const selected = AVAILABLE_MODELS.find((m) => m.name === model) ?? AVAILABLE_MODELS[1]
+  const cloudModel = selected.provider === 'vercel-ai-gateway'
   return (
     <div className="drag flex h-full w-full flex-col">
       <div className="h-9" />
@@ -102,9 +148,9 @@ function WelcomeScreen({
             <GemmaLogo className="mx-auto mb-5 h-24 w-24" />
             <h1 className="text-[26px] font-semibold tracking-tight">Welcome to Gemma Chat</h1>
             <p className="mt-2 text-[13.5px] leading-relaxed text-ink-400">
-              A local AI assistant, powered by Google's Gemma 4.
+              A coding assistant powered by local Gemma models or Vercel AI Gateway.
               <br />
-              Runs 100% on your Mac. No account, no cloud.
+              Choose local-first privacy or a stronger cloud model.
             </p>
           </div>
 
@@ -130,6 +176,11 @@ function WelcomeScreen({
                         Recommended
                       </span>
                     )}
+                    {m.provider === 'vercel-ai-gateway' && (
+                      <span className="rounded-full bg-sky-400/15 px-2 py-[1px] text-[10px] font-medium uppercase tracking-wider text-sky-200">
+                        Cloud
+                      </span>
+                    )}
                   </div>
                   <span className="text-xs tabular-nums text-ink-400">{m.size}</span>
                 </div>
@@ -144,10 +195,12 @@ function WelcomeScreen({
             onClick={() => onStart(selected.name)}
             className="mt-6 w-full rounded-xl bg-white py-3 text-sm font-medium text-ink-900 transition hover:bg-white/90 active:scale-[0.99]"
           >
-            Download {selected.label} &nbsp;·&nbsp; {selected.size}
+            {cloudModel ? `Use ${selected.label}` : `Download ${selected.label} · ${selected.size}`}
           </button>
           <p className="mt-3 text-center text-[11px] text-ink-400">
-            We'll install MLX runtime if needed. Model weights are cached locally.
+            {cloudModel
+              ? 'Requires AI_GATEWAY_API_KEY or VERCEL_OIDC_TOKEN in your environment.'
+              : "We'll install MLX runtime if needed. Model weights are cached locally."}
           </p>
         </div>
       </div>
@@ -155,8 +208,11 @@ function WelcomeScreen({
   )
 }
 
-function StageList({ status }: { status: SetupStatus }) {
-  const stages: Array<{ key: SetupStatus['stage']; label: string }> = [
+function StageList({ status, cloudModel }: { status: SetupStatus; cloudModel: boolean }) {
+  const stages: Array<{ key: SetupStatus['stage']; label: string }> = cloudModel ? [
+    { key: 'checking', label: 'Check AI Gateway credentials' },
+    { key: 'ready', label: 'Ready to chat' }
+  ] : [
     { key: 'installing-mlx', label: 'Install MLX runtime' },
     { key: 'starting-mlx', label: 'Start runtime & load model' },
     { key: 'downloading-model', label: 'Download model' },

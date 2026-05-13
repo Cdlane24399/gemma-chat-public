@@ -1,17 +1,18 @@
 import { app, shell, BrowserWindow, ipcMain, nativeTheme, session, nativeImage } from 'electron'
-import { join } from 'path'
+import { dirname, join } from 'path'
+import { fileURLToPath } from 'url'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
-import { AVAILABLE_MODELS } from '@shared/types'
+import { isCloudModel, modelInfo } from '@shared/types'
 import {
   locateMLX,
   installMLX,
   startServer,
   stopServer,
-  hasModel,
   chatStream,
   listLocalModels,
   type MLXChatMessage
 } from './mlx'
+import { gatewayChatStream, verifyGatewayModel } from './gateway'
 import {
   TOOLS,
   chatSystemPrompt,
@@ -26,6 +27,7 @@ import {
   ensureWorkspace,
   startWorkspaceServer,
   stopWorkspaceServer,
+  stopAllWorkspaceDevServers,
   getWorkspaceServerPort,
   previewUrl,
   listTree,
@@ -35,6 +37,7 @@ import {
 import type { ChatRequest, StreamChunk, ToolCall } from '../shared/types'
 
 let mainWindow: BrowserWindow | null = null
+const __dirname = dirname(fileURLToPath(import.meta.url))
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -109,7 +112,7 @@ async function ensureMLXRunning(model: string): Promise<string> {
 
   mlxPython = pythonToUse
 
-  const label = AVAILABLE_MODELS.find((m) => m.name === model)?.label ?? model
+  const label = modelInfo(model)?.label ?? model
   send('setup:status', { stage: 'starting-mlx', message: 'Starting model runtime…' })
   send('setup:status', {
     stage: 'downloading-model',
@@ -127,6 +130,14 @@ async function ensureMLXRunning(model: string): Promise<string> {
 
 async function handleSetup(model: string): Promise<void> {
   try {
+    if (isCloudModel(model)) {
+      const label = modelInfo(model)?.label ?? model
+      send('setup:status', { stage: 'checking', message: `Checking ${label}…` })
+      await verifyGatewayModel(model)
+      send('setup:status', { stage: 'ready', message: 'Ready to chat.' })
+      return
+    }
+
     send('setup:status', { stage: 'checking', message: 'Checking system…' })
     await ensureMLXRunning(model)
     send('setup:status', { stage: 'ready', message: 'Ready to chat.' })
@@ -144,6 +155,9 @@ const MAX_TOOL_ROUNDS_CODE = 40
 
 function actionTarget(_name: string, args: Record<string, unknown>): string | undefined {
   if (typeof args.path === 'string') return args.path
+  if (typeof args.name === 'string') return String(args.name)
+  if (typeof args.packages === 'string') return String(args.packages).slice(0, 80)
+  if (typeof args.script === 'string') return `script:${String(args.script)}`
   if (typeof args.query === 'string') return String(args.query)
   if (typeof args.url === 'string') return String(args.url)
   if (typeof args.command === 'string')
@@ -159,13 +173,14 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
 
   try {
     const baseMessages: MLXChatMessage[] = []
+    const runtime = isCloudModel(req.model) ? 'cloud' : 'local'
 
     if (req.mode === 'code') {
       const wsPath = await ensureWorkspace(req.conversationId)
       const href = previewUrl(req.conversationId)
-      baseMessages.push({ role: 'system', content: codeSystemPrompt(wsPath, href) })
+      baseMessages.push({ role: 'system', content: codeSystemPrompt(wsPath, href, runtime) })
     } else {
-      baseMessages.push({ role: 'system', content: chatSystemPrompt(req.enableTools) })
+      baseMessages.push({ role: 'system', content: chatSystemPrompt(req.enableTools, runtime) })
     }
 
     for (const m of req.messages) {
@@ -253,7 +268,8 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
         }
       }
 
-      streamLoop: for await (const chunk of chatStream({
+      const stream = isCloudModel(req.model) ? gatewayChatStream : chatStream
+      streamLoop: for await (const chunk of stream({
         model: req.model,
         messages: baseMessages,
         signal: abort.signal
@@ -418,7 +434,7 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
           baseMessages.push({
             role: 'user',
             content:
-              'Good plan. Now start building — emit a write_file action with the first file immediately.'
+              'Good plan. Now start building — emit the next tool action immediately. For a new website, use create_project first.'
           })
           emit({ type: 'activity', activity: { kind: 'thinking', chars: 0 } })
           continue // go to round 1
@@ -477,15 +493,24 @@ app.whenReady().then(async () => {
   })
 
   ipcMain.handle('model:switch', async (_e, model: string) => {
-    const label = AVAILABLE_MODELS.find((m) => m.name === model)?.label ?? model
+    const label = modelInfo(model)?.label ?? model
     send('setup:status', {
       stage: 'downloading-model',
       message: `Switching to ${label}…`
     })
     try {
+      if (isCloudModel(model)) {
+        await stopServer()
+        await verifyGatewayModel(model)
+        send('setup:status', { stage: 'ready', message: 'Ready to chat.' })
+        return
+      }
+
       await stopServer()
       if (!mlxPython) {
-        throw new Error('MLX Python path not available. Please restart the app.')
+        mlxPython = await ensureMLXRunning(model)
+        send('setup:status', { stage: 'ready', message: 'Ready to chat.' })
+        return
       }
       await startServer(mlxPython, model, (p) => {
         send('setup:status', {
@@ -580,5 +605,6 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   stopServer()
+  void stopAllWorkspaceDevServers()
   stopWorkspaceServer()
 })

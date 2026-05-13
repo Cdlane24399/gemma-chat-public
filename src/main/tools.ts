@@ -6,7 +6,12 @@ import {
   wsRunBash,
   ensureWorkspace,
   listTree,
-  previewUrl
+  previewUrl,
+  createViteReactProject,
+  wsInstallPackages,
+  startWorkspaceDevServer,
+  stopWorkspaceDevServer,
+  workspaceDevServerStatus
 } from './workspace'
 
 export interface ToolContext {
@@ -251,6 +256,106 @@ async function runBash(args: Record<string, unknown>, ctx: ToolContext): Promise
   }
 }
 
+async function createProject(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
+  const template = String(args.template ?? 'vite-react-ts').trim()
+  if (template !== 'vite-react-ts') {
+    return 'Error: unsupported template. Use vite-react-ts.'
+  }
+  const name = String(args.name ?? 'gemma-site').trim() || 'gemma-site'
+  const reset = args.reset === true || args.reset === 'true'
+  try {
+    const files = await createViteReactProject(ctx.conversationId, name, reset)
+    ctx.onFileChange?.()
+    return [
+      `Created ${template} project (${files.length} files).`,
+      'Files:',
+      ...files.map((f) => `- ${f}`),
+      '',
+      'Next: run install_packages, then edit files and start_dev_server.'
+    ].join('\n')
+  } catch (e) {
+    return `Error creating project: ${(e as Error).message}`
+  }
+}
+
+function parsePackages(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(String).map((s) => s.trim()).filter(Boolean)
+  if (typeof value !== 'string') return []
+  return value
+    .split(/[\s,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+}
+
+async function installPackages(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
+  const packages = parsePackages(args.packages)
+  const dev = args.dev === true || args.dev === 'true'
+  const timeout = typeof args.timeout_ms === 'number' ? args.timeout_ms : 180_000
+  try {
+    const r = await wsInstallPackages(ctx.conversationId, packages, dev, timeout)
+    ctx.onFileChange?.()
+    const parts: string[] = []
+    parts.push(
+      packages.length
+        ? `package install ${r.exitCode === 0 ? 'succeeded' : 'failed'}: ${packages.join(', ')}`
+        : `dependency install ${r.exitCode === 0 ? 'succeeded' : 'failed'}`
+    )
+    parts.push(`exit=${r.exitCode ?? 'killed'} (${r.durationMs}ms)`)
+    if (r.stdout) parts.push('stdout:\n' + r.stdout)
+    if (r.stderr) parts.push('stderr:\n' + r.stderr)
+    if (r.truncated) parts.push('[output was truncated]')
+    return parts.join('\n')
+  } catch (e) {
+    return `Error installing packages: ${(e as Error).message}`
+  }
+}
+
+async function startDevServer(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
+  const script = String(args.script ?? 'dev').trim() || 'dev'
+  try {
+    const status = await startWorkspaceDevServer(ctx.conversationId, script)
+    ctx.onFileChange?.()
+    if (!status.running) {
+      return [
+        'Dev server failed to start.',
+        status.lastOutput ? `Output:\n${status.lastOutput}` : 'No output captured.'
+      ].join('\n')
+    }
+    return [
+      `Dev server started${status.url ? ` at ${status.url}` : ''}.`,
+      `Command: ${status.command ?? script}`,
+      status.url
+        ? 'Canvas preview now uses the live local dev server.'
+        : 'Server is running but has not printed a URL yet. Check status_dev_server shortly.'
+    ].join('\n')
+  } catch (e) {
+    return `Error starting dev server: ${(e as Error).message}`
+  }
+}
+
+async function stopDevServer(_args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
+  const status = await stopWorkspaceDevServer(ctx.conversationId)
+  ctx.onFileChange?.()
+  if (!status.lastOutput) return 'Dev server stopped.'
+  return `Dev server stopped. Last output:\n${status.lastOutput}`
+}
+
+async function statusDevServer(
+  _args: Record<string, unknown>,
+  ctx: ToolContext
+): Promise<string> {
+  const status = workspaceDevServerStatus(ctx.conversationId)
+  if (!status.running) return 'Dev server is not running.'
+  return [
+    `running=true${status.url ? ` url=${status.url}` : ''}`,
+    status.command ? `command=${status.command}` : '',
+    status.pid ? `pid=${status.pid}` : '',
+    status.lastOutput ? `last output:\n${status.lastOutput}` : ''
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
 async function openPreview(_args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
   const url = previewUrl(ctx.conversationId)
   return `Preview is live at ${url}. The Canvas pane on the right shows it.`
@@ -334,6 +439,58 @@ export const TOOLS: Record<string, ToolSpec> = {
     mode: 'code',
     run: deleteFile
   },
+  create_project: {
+    name: 'create_project',
+    description:
+      'Create a starter website project. Default is a Vite + React + TypeScript app with src/App.tsx, src/styles.css, package.json, and Vite config.',
+    params: [
+      { name: 'template', description: 'template name; use vite-react-ts' },
+      { name: 'name', description: 'package/project name' },
+      { name: 'reset', description: 'true to replace starter project files if package.json exists' }
+    ],
+    example:
+      '<action name="create_project">\n<template>vite-react-ts</template>\n<name>studio-site</name>\n</action>',
+    mode: 'code',
+    run: createProject
+  },
+  install_packages: {
+    name: 'install_packages',
+    description:
+      'Install dependencies for the generated project. With no packages, installs package.json. With packages, adds them safely.',
+    params: [
+      { name: 'packages', description: 'optional space/comma separated packages to add' },
+      { name: 'dev', description: 'true to add packages as development dependencies' },
+      { name: 'timeout_ms', description: 'optional install timeout in milliseconds' }
+    ],
+    example: '<action name="install_packages">\n<packages></packages>\n</action>',
+    mode: 'code',
+    run: installPackages
+  },
+  start_dev_server: {
+    name: 'start_dev_server',
+    description:
+      'Start the local project dev server and route the Canvas preview to it. Stops any previous dev server for this chat first.',
+    params: [{ name: 'script', description: 'npm script to run; defaults to dev' }],
+    example: '<action name="start_dev_server">\n<script>dev</script>\n</action>',
+    mode: 'code',
+    run: startDevServer
+  },
+  stop_dev_server: {
+    name: 'stop_dev_server',
+    description: 'Stop the local dev server for this chat.',
+    params: [],
+    example: '<action name="stop_dev_server"></action>',
+    mode: 'code',
+    run: stopDevServer
+  },
+  status_dev_server: {
+    name: 'status_dev_server',
+    description: 'Check whether the local dev server is running and show its latest output.',
+    params: [],
+    example: '<action name="status_dev_server"></action>',
+    mode: 'code',
+    run: statusDevServer
+  },
   run_bash: {
     name: 'run_bash',
     description:
@@ -388,18 +545,31 @@ function renderToolHelp(mode: 'chat' | 'code'): string {
   return lines.join('\n')
 }
 
-export function chatSystemPrompt(enableTools: boolean): string {
+type RuntimeKind = 'local' | 'cloud'
+
+function assistantIdentity(runtime: RuntimeKind, mode: 'chat' | 'code'): string {
+  if (runtime === 'cloud') {
+    return mode === 'code'
+      ? 'You are a coding agent connected through Vercel AI Gateway.'
+      : 'You are an AI assistant connected through Vercel AI Gateway.'
+  }
+  return mode === 'code'
+    ? "You are Gemma, a local coding agent running entirely on the user's Mac."
+    : "You are Gemma, an AI assistant running 100% locally on the user's Mac."
+}
+
+export function chatSystemPrompt(enableTools: boolean, runtime: RuntimeKind = 'local'): string {
   const now = new Date().toISOString()
   const day = new Date().toLocaleDateString('en-US', { weekday: 'long' })
   if (!enableTools) {
     return [
-      "You are Gemma, an AI assistant running 100% locally on the user's Mac.",
+      assistantIdentity(runtime, 'chat'),
       `Current date/time: ${now} (${day}). Timezone: ${tz()}.`,
       'Be clear, concise, and helpful. Use markdown for formatting when useful.'
     ].join('\n')
   }
   return [
-    "You are Gemma, an AI assistant running 100% locally on the user's Mac.",
+    assistantIdentity(runtime, 'chat'),
     `Current date/time: ${now} (${day}). Timezone: ${tz()}.`,
     '',
     'TOOL USE',
@@ -423,34 +593,43 @@ export function chatSystemPrompt(enableTools: boolean): string {
   ].join('\n')
 }
 
-export function codeSystemPrompt(workspacePath: string, previewHref: string): string {
+export function codeSystemPrompt(
+  workspacePath: string,
+  previewHref: string,
+  runtime: RuntimeKind = 'local'
+): string {
   const now = new Date().toISOString()
   const day = new Date().toLocaleDateString('en-US', { weekday: 'long' })
   return [
-    "You are Gemma, a local coding agent running entirely on the user's Mac.",
+    assistantIdentity(runtime, 'code'),
     `Date: ${now} (${day}). Workspace: ${workspacePath}. Preview: ${previewHref}`,
     '',
     'WHAT TO BUILD',
-    'You build small apps, pages, demos, and scripts. Quality matters — the user is watching.',
-    '- Modern, polished design by default: clean typography, generous whitespace, subtle gradients, rounded corners, smooth transitions. Dark-mode-friendly when it fits.',
+    'You build real editable websites and apps inside a local project workspace. Quality matters — the user is watching.',
+    '- For websites, dashboards, multi-screen apps, or anything non-trivial, use the Vite React TypeScript project workflow by default.',
+    '- Modern, polished design by default: clean typography, generous whitespace, thoughtful color, rounded corners, smooth transitions. Dark-mode-friendly when it fits.',
     '- Real-feeling copy, not lorem ipsum. Invent brand names and details.',
     '- Make it actually work: click handlers wired, animations smooth, forms usable.',
-    '- Fetch real images only when asked; otherwise use CSS/SVG for illustrations.',
+    '- Use package management when a proven library is the right tool. Prefer lucide-react for icons in React projects.',
     '',
-    'FILE STRUCTURE — PREFER MULTI-FILE FOR ANYTHING NON-TRIVIAL',
-    '- One-off widgets / tiny demos → single `index.html` with <style> + <script> inline.',
-    '- Landing pages, apps with state, anything > ~200 lines → split into:',
-    '    `index.html` — structure + <link rel="stylesheet" href="style.css"> + <script src="app.js" defer></script>',
-    '    `style.css`  — all styling',
-    '    `app.js`     — all behavior',
-    '- Multi-file is easier to read, edit later, and shows off modular thinking. Emit a separate write_file action for each file.',
+    'PROJECT WORKFLOW — DEFAULT FOR WEBSITES',
+    '- New website/app request with no existing package.json → first action: `create_project` with template `vite-react-ts`.',
+    '- After creating a project → run `install_packages` with no packages to install package.json dependencies.',
+    '- Build by editing `src/App.tsx`, `src/styles.css`, and any additional files/components you create.',
+    '- Add libraries with `install_packages` instead of raw shell commands whenever possible.',
+    '- Start the live preview with `start_dev_server` after core files are ready. Use `status_dev_server` for server errors and `stop_dev_server` when replacing or ending a running project server.',
+    '- If package.json already exists, read/list files first and continue editing the existing project instead of recreating it.',
+    '',
+    'STATIC FILE FALLBACK',
+    '- Only use loose `index.html`, `style.css`, and `app.js` for tiny one-off demos or when the user explicitly asks for plain static files.',
+    '- For static builds, still split non-trivial work into multiple files and call `open_preview` when done.',
     '',
     'HOW YOU WORK',
-    '1. Start with ONE sentence describing your plan (e.g., "I\'ll split this into index.html, style.css, and app.js."). Then IMMEDIATELY emit your first write_file action in the SAME response. Do NOT stop after planning — start building right away.',
+    '1. Start with ONE sentence describing the immediate next step. Then IMMEDIATELY emit the first action in the SAME response. For most new websites this is `create_project`; for existing projects it is often `list_files` or `read_file`; for tiny static demos it may be `write_file`.',
     '2. After each action, STOP and wait for the result. In subsequent turns, one sentence of narration (e.g., "Now the stylesheet."), then the action, then STOP.',
-    '3. After all files are written, call `open_preview`, then write a one-sentence plain-text summary. Emit no further actions.',
+    '3. After project files are ready, call `start_dev_server`. If the server starts cleanly, write a short plain-text summary. Emit no further actions.',
     '',
-    'CRITICAL: You MUST emit a write_file action in your VERY FIRST response. Never respond with only a plan or description. Always start coding immediately.',
+    'CRITICAL: You MUST emit a tool action in your VERY FIRST response. Never respond with only a plan or description. Always start building immediately.',
     '',
     'ACTION FORMAT — EXACT',
     '<action name="tool_name">',
@@ -466,26 +645,15 @@ export function codeSystemPrompt(workspacePath: string, previewHref: string): st
     '',
     'EXAMPLE — multi-file build (FIRST response)',
     '',
-    "I'll split this into three files: index.html for structure, style.css for the design, and app.js for the countdown behavior. Starting with the HTML shell.",
+    "I'll start a Vite React project so this can grow as an editable app.",
     '',
-    '<action name="write_file">',
-    '<path>index.html</path>',
-    '<content>',
-    '<!doctype html>',
-    '<html lang="en">',
-    '<head>',
-    '<meta charset="utf-8">',
-    '<title>Coming Soon</title>',
-    '<link rel="stylesheet" href="style.css">',
-    '<script src="app.js" defer></script>',
-    '</head>',
-    '<body><main><h1>Coming soon</h1></main></body>',
-    '</html>',
-    '</content>',
+    '<action name="create_project">',
+    '<template>vite-react-ts</template>',
+    '<name>coming-soon-site</name>',
     '</action>',
     '',
     'HARD RULES',
-    '- ALWAYS start coding in your first response. Never reply with only a plan.',
+    '- ALWAYS start with an action in your first response. Never reply with only a plan.',
     '- Never paste file contents in your chat reply — only inside <content>.',
     '- Never wrap <action> tags in ``` code fences.',
     '- Paths are relative to the workspace (no leading slashes).',

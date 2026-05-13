@@ -78,13 +78,14 @@ export type StreamChunk =
   | { type: 'error'; error: string }
 
 export interface ModelInfo {
-  /** HuggingFace repo ID — used internally for mlx_lm */
+  /** Runtime model ID */
   name: string
   /** Short, user-friendly display name */
   label: string
   size: string
   sizeBytes: number
   description: string
+  provider: 'local' | 'vercel-ai-gateway'
   recommended?: boolean
 }
 
@@ -94,7 +95,8 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
     label: 'Gemma 4 E2B',
     size: '1.5 GB',
     sizeBytes: 1_500_000_000,
-    description: 'Edge-sized. Fast & lightweight. Text + image + audio. Runs on 8GB+ Macs.'
+    description: 'Edge-sized. Fast & lightweight. Text + image + audio. Runs on 8GB+ Macs.',
+    provider: 'local'
   },
   {
     name: 'mlx-community/gemma-4-e4b-it-4bit',
@@ -102,6 +104,7 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
     size: '3 GB',
     sizeBytes: 3_000_000_000,
     description: 'Best all-rounder. Text + image + audio. Runs on 8GB+ Macs.',
+    provider: 'local',
     recommended: true
   },
   {
@@ -109,16 +112,33 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
     label: 'Gemma 4 27B MoE',
     size: '16 GB',
     sizeBytes: 16_000_000_000,
-    description: 'Mixture-of-Experts (26B, 4B active). 16GB+ RAM recommended.'
+    description: 'Mixture-of-Experts (26B, 4B active). 16GB+ RAM recommended.',
+    provider: 'local'
   },
   {
     name: 'mlx-community/gemma-4-31b-it-4bit',
     label: 'Gemma 4 31B',
     size: '18 GB',
     sizeBytes: 18_000_000_000,
-    description: 'Frontier dense model. Best quality. 32GB+ RAM recommended.'
+    description: 'Frontier dense model. Best quality. 32GB+ RAM recommended.',
+    provider: 'local'
+  },
+  {
+    name: 'xiaomi/mimo-v2.5-pro',
+    label: 'MiMo V2.5 Pro',
+    size: 'Cloud',
+    sizeBytes: 0,
+    description: 'Vercel AI Gateway model for stronger coding, reasoning, and long-horizon tasks.',
+    provider: 'vercel-ai-gateway'
   }
 ]
 
 export const DEFAULT_MODEL = 'mlx-community/gemma-4-e4b-it-4bit'
 
+export function modelInfo(model: string): ModelInfo | undefined {
+  return AVAILABLE_MODELS.find((m) => m.name === model)
+}
+
+export function isCloudModel(model: string): boolean {
+  return modelInfo(model)?.provider === 'vercel-ai-gateway'
+}

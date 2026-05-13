@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { marked } from 'marked'
 import type { AgentActivity, ChatMessage, ToolCall } from '@shared/types'
 import gemmaLogoUrl from '../assets/gemma-logo.png'
@@ -8,6 +8,8 @@ interface Props {
   isLast: boolean
   streaming: boolean
   onRegenerate?: () => void
+  onEdit?: (newText: string) => void
+  onDelete?: () => void
 }
 
 interface Parsed {
@@ -32,17 +34,22 @@ function parseThinking(content: string): Parsed {
   return { thinking, thinkingInProgress: false, visible: (before + rest).trim() }
 }
 
-export default function Message({
+function MessageImpl({
   message,
   streaming,
-  onRegenerate
+  onRegenerate,
+  onEdit,
+  onDelete
 }: Props) {
   const isUser = message.role === 'user'
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(message.content)
   const parsed = useMemo(() => parseThinking(message.content), [message.content])
   const html = useMemo(() => {
     if (!parsed.visible) return ''
     try {
-      return marked.parse(parsed.visible, { async: false, breaks: true }) as string
+      const raw = marked.parse(parsed.visible, { async: false, breaks: true }) as string
+      return sanitizeHtml(raw)
     } catch {
       return escapeHtml(parsed.visible).replace(/\n/g, '<br/>')
     }
@@ -50,10 +57,89 @@ export default function Message({
 
   if (isUser) {
     return (
-      <div className="flex justify-end">
-        <div className="selectable max-w-[78%] rounded-2xl rounded-br-md bg-white/[0.08] px-4 py-2.5 text-[14.5px] leading-relaxed text-white">
-          <div className="whitespace-pre-wrap">{message.content}</div>
-        </div>
+      <div className="group flex flex-col items-end">
+        {editing ? (
+          <div className="flex w-full max-w-[78%] flex-col gap-2 rounded-2xl border border-white/15 bg-white/[0.04] p-2">
+            <textarea
+              autoFocus
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              rows={Math.min(10, Math.max(2, draft.split('\n').length))}
+              className="w-full resize-none rounded bg-transparent px-2 py-1.5 text-[14.5px] leading-relaxed text-white focus:outline-none"
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') {
+                  e.preventDefault()
+                  setEditing(false)
+                  setDraft(message.content)
+                } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                  e.preventDefault()
+                  if (draft.trim() && onEdit) onEdit(draft.trim())
+                  setEditing(false)
+                }
+              }}
+            />
+            <div className="flex justify-end gap-1">
+              <button
+                onClick={() => {
+                  setEditing(false)
+                  setDraft(message.content)
+                }}
+                className="rounded-md px-2 py-1 text-[11px] text-ink-400 hover:bg-white/5 hover:text-white"
+              >
+                Cancel
+              </button>
+              <button
+                disabled={!draft.trim() || !onEdit}
+                onClick={() => {
+                  if (draft.trim() && onEdit) onEdit(draft.trim())
+                  setEditing(false)
+                }}
+                className="rounded-md bg-white px-2 py-1 text-[11px] font-medium text-ink-900 hover:bg-white/90 disabled:opacity-40"
+              >
+                Save & resubmit
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="selectable max-w-[78%] rounded-2xl rounded-br-md bg-white/[0.08] px-4 py-2.5 text-[14.5px] leading-relaxed text-white">
+            <div className="whitespace-pre-wrap">{message.content}</div>
+          </div>
+        )}
+        {!editing && (onEdit || onDelete) && (
+          <div className="mt-1 flex gap-0.5 opacity-0 transition group-hover:opacity-100">
+            {onEdit && (
+              <button
+                onClick={() => {
+                  setDraft(message.content)
+                  setEditing(true)
+                }}
+                aria-label="Edit message"
+                title="Edit"
+                className="rounded-md px-2 py-0.5 text-[11px] text-ink-400 hover:bg-white/5 hover:text-white"
+              >
+                Edit
+              </button>
+            )}
+            <button
+              onClick={() => navigator.clipboard.writeText(message.content)}
+              aria-label="Copy message"
+              title="Copy"
+              className="rounded-md px-2 py-0.5 text-[11px] text-ink-400 hover:bg-white/5 hover:text-white"
+            >
+              Copy
+            </button>
+            {onDelete && (
+              <button
+                onClick={onDelete}
+                aria-label="Delete message"
+                title="Delete"
+                className="rounded-md px-2 py-0.5 text-[11px] text-ink-400 hover:bg-red-500/10 hover:text-red-300"
+              >
+                Delete
+              </button>
+            )}
+          </div>
+        )}
       </div>
     )
   }
@@ -98,25 +184,94 @@ export default function Message({
           </div>
         )}
 
-        {onRegenerate && (
-          <div className="mt-2 flex gap-1 opacity-0 transition group-hover:opacity-100">
-            <button
-              onClick={onRegenerate}
-              className="rounded-md px-2 py-1 text-[11px] text-ink-400 hover:bg-white/5 hover:text-white"
-            >
-              ↻ Regenerate
-            </button>
+        {(onRegenerate || onDelete) && !showCursor && (
+          <div className="mt-2 flex items-center gap-1 opacity-0 transition group-hover:opacity-100">
+            {onRegenerate && (
+              <button
+                onClick={onRegenerate}
+                aria-label="Regenerate response"
+                title="Regenerate"
+                className="rounded-md px-2 py-1 text-[11px] text-ink-400 hover:bg-white/5 hover:text-white"
+              >
+                ↻ Regenerate
+              </button>
+            )}
             <button
               onClick={() => navigator.clipboard.writeText(parsed.visible)}
+              aria-label="Copy rendered text"
+              title="Copy text"
               className="rounded-md px-2 py-1 text-[11px] text-ink-400 hover:bg-white/5 hover:text-white"
             >
               Copy
             </button>
+            <button
+              onClick={() => navigator.clipboard.writeText(message.content)}
+              aria-label="Copy raw markdown"
+              title="Copy raw markdown"
+              className="rounded-md px-2 py-1 text-[11px] text-ink-400 hover:bg-white/5 hover:text-white"
+            >
+              Copy raw
+            </button>
+            {onDelete && (
+              <button
+                onClick={onDelete}
+                aria-label="Delete message"
+                title="Delete"
+                className="rounded-md px-2 py-1 text-[11px] text-ink-400 hover:bg-red-500/10 hover:text-red-300"
+              >
+                Delete
+              </button>
+            )}
+            {message.createdAt && (
+              <span
+                className="ml-auto text-[10.5px] text-ink-500"
+                title={new Date(message.createdAt).toLocaleString()}
+              >
+                {formatRelative(message.createdAt)}
+              </span>
+            )}
           </div>
         )}
       </div>
     </div>
   )
+}
+
+// Skip re-renders when the message content / streaming state did not change.
+// Callback identities can churn (parent uses inline arrows) so we deliberately
+// don't compare them — Message captures the latest via props each render anyway
+// because we re-render when any non-callback prop changes.
+const Message = memo(MessageImpl, (prev, next) => {
+  return (
+    prev.message === next.message &&
+    prev.streaming === next.streaming &&
+    prev.isLast === next.isLast &&
+    !prev.onEdit === !next.onEdit &&
+    !prev.onDelete === !next.onDelete &&
+    !prev.onRegenerate === !next.onRegenerate
+  )
+})
+export default Message
+
+function formatRelative(ts: number): string {
+  const diff = Date.now() - ts
+  if (diff < 60_000) return 'just now'
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`
+  if (diff < 604_800_000) return `${Math.floor(diff / 86_400_000)}d ago`
+  return new Date(ts).toLocaleDateString()
+}
+
+function sanitizeHtml(input: string): string {
+  // Minimal sanitizer for marked output: strip <script>, on*= handlers,
+  // and javascript: URLs. This is a local app rendering its own model's
+  // output so we don't need a full purifier — only basic XSS hygiene.
+  let out = input.replace(/<script\b[\s\S]*?<\/script>/gi, '')
+  out = out.replace(/<style\b[\s\S]*?<\/style>/gi, '')
+  out = out.replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+  out = out.replace(/(href|src)\s*=\s*"\s*javascript:[^"]*"/gi, '$1="#"')
+  out = out.replace(/(href|src)\s*=\s*'\s*javascript:[^']*'/gi, "$1='#'")
+  return out
 }
 
 const THINKING_VERBS = [
@@ -154,7 +309,7 @@ function ActivityBar({
       const id = window.setInterval(() => {
         verbIdxRef.current++
         setVerbIdx(verbIdxRef.current)
-      }, 3500)
+      }, 7000)
       return () => window.clearInterval(id)
     }
     return undefined

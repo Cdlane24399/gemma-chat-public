@@ -1,12 +1,34 @@
 import { app } from 'electron'
-import { createServer, type Server } from 'http'
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'http'
 import { createReadStream } from 'fs'
 import { mkdir, readFile, writeFile, readdir, stat, access, rm, rename } from 'fs/promises'
 import { join, resolve, dirname, extname, relative, sep } from 'path'
-import { spawn } from 'child_process'
+import { spawn, type ChildProcessWithoutNullStreams } from 'child_process'
 
 let server: Server | null = null
 let serverPort = 0
+
+interface ManagedDevServer {
+  conversationId: string
+  command: string
+  proc: ChildProcessWithoutNullStreams
+  startedAt: number
+  url?: string
+  lastOutput: string
+  exitCode?: number | null
+}
+
+export interface DevServerStatus {
+  running: boolean
+  url?: string
+  command?: string
+  pid?: number
+  startedAt?: number
+  exitCode?: number | null
+  lastOutput?: string
+}
+
+const devServers = new Map<string, ManagedDevServer>()
 
 export function workspacesRoot(): string {
   return join(app.getPath('userData'), 'workspaces')
@@ -18,6 +40,10 @@ export function workspaceDir(conversationId: string): string {
 
 function sanitizeId(id: string): string {
   return id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80) || 'default'
+}
+
+function devServerKey(conversationId: string): string {
+  return sanitizeId(conversationId)
 }
 
 export async function ensureWorkspace(conversationId: string): Promise<string> {
@@ -90,6 +116,11 @@ export async function startWorkspaceServer(): Promise<number> {
       const id = parts[0]
       const root = workspaceDir(id)
       const rel = parts.slice(1).join('/') || ''
+
+      if (await proxyDevServer(id, rel, url.search, req, res)) {
+        return
+      }
+
       let target: string
       try {
         target = assertInWorkspace(root, rel)
@@ -172,7 +203,45 @@ export function getWorkspaceServerPort(): number {
 }
 
 export function previewUrl(conversationId: string): string {
+  const dev = workspaceDevServerStatus(conversationId)
+  if (dev.running && dev.url) return dev.url
   return `http://127.0.0.1:${serverPort}/${sanitizeId(conversationId)}/`
+}
+
+async function proxyDevServer(
+  conversationId: string,
+  rel: string,
+  search: string,
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<boolean> {
+  const dev = devServers.get(devServerKey(conversationId))
+  if (!dev?.url || dev.exitCode !== undefined) return false
+
+  try {
+    const path = `/${rel}${search}`
+    const target = new URL(path, dev.url)
+    const upstream = await fetch(target, {
+      method: req.method,
+      headers: {
+        accept: req.headers.accept ?? '*/*',
+        'user-agent': req.headers['user-agent'] ?? 'gemma-chat-preview'
+      }
+    })
+
+    const headers: Record<string, string> = {}
+    upstream.headers.forEach((value, key) => {
+      if (key.toLowerCase() === 'content-encoding') return
+      if (key.toLowerCase() === 'transfer-encoding') return
+      headers[key] = value
+    })
+    res.writeHead(upstream.status, headers)
+    const body = Buffer.from(await upstream.arrayBuffer())
+    res.end(body)
+    return true
+  } catch {
+    return false
+  }
 }
 
 function renderPlaceholder(_id: string): string {
@@ -317,6 +386,449 @@ export async function wsDeleteFile(conversationId: string, path: string): Promis
   const base = await ensureWorkspace(conversationId)
   const target = assertInWorkspace(base, path)
   await rm(target, { recursive: true, force: true })
+}
+
+export async function createViteReactProject(
+  conversationId: string,
+  name = 'gemma-site',
+  reset = false
+): Promise<string[]> {
+  const base = await ensureWorkspace(conversationId)
+  const packagePath = join(base, 'package.json')
+  if (!reset) {
+    try {
+      await access(packagePath)
+      throw new Error(
+        'package.json already exists. Read the current project first, or pass reset=true to replace the starter project files.'
+      )
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+    }
+  }
+
+  if (reset) {
+    await Promise.all([
+      rm(join(base, 'src'), { recursive: true, force: true }),
+      rm(join(base, 'index.html'), { force: true }),
+      rm(join(base, 'vite.config.ts'), { force: true }),
+      rm(join(base, 'tsconfig.json'), { force: true }),
+      rm(packagePath, { force: true })
+    ])
+  }
+
+  const projectName = packageName(name)
+  const files: Record<string, string> = {
+    'package.json': JSON.stringify(
+      {
+        name: projectName,
+        private: true,
+        version: '0.0.0',
+        type: 'module',
+        scripts: {
+          dev: 'vite --host 127.0.0.1',
+          build: 'tsc --noEmit && vite build',
+          preview: 'vite preview --host 127.0.0.1'
+        },
+        dependencies: {
+          '@vitejs/plugin-react': '^4.3.4',
+          'lucide-react': '^0.468.0',
+          react: '^19.0.0',
+          'react-dom': '^19.0.0'
+        },
+        devDependencies: {
+          '@types/react': '^19.0.7',
+          '@types/react-dom': '^19.0.3',
+          typescript: '^5.7.3',
+          vite: '^6.0.11'
+        }
+      },
+      null,
+      2
+    ) + '\n',
+    'index.html': `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>${escapeHtml(projectName)}</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+`,
+    'vite.config.ts': `import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    host: '127.0.0.1'
+  },
+  preview: {
+    host: '127.0.0.1'
+  }
+})
+`,
+    'tsconfig.json': `{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["DOM", "DOM.Iterable", "ES2020"],
+    "allowJs": false,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx"
+  },
+  "include": ["src"]
+}
+`,
+    'src/main.tsx':
+      "import React from 'react'\n" +
+      "import { createRoot } from 'react-dom/client'\n" +
+      "import App from './App'\n" +
+      "import './styles.css'\n" +
+      '\n' +
+      "createRoot(document.getElementById('root')!).render(\n" +
+      '  <React.StrictMode>\n' +
+      '    <App />\n' +
+      '  </React.StrictMode>\n' +
+      ')\n',
+    'src/App.tsx':
+      "import { Sparkles } from 'lucide-react'\n" +
+      '\n' +
+      'export default function App() {\n' +
+      '  return (\n' +
+      '    <main className="shell">\n' +
+      '      <section className="hero" aria-label="Generated site starter">\n' +
+      '        <p className="eyebrow">Vite React workspace</p>\n' +
+      '        <h1>Ready for the next website.</h1>\n' +
+      '        <p className="lede">\n' +
+      "          Ask Gemma to shape this starter into a polished site. It can edit components,\n" +
+      '          add files, install packages, and run the local preview server.\n' +
+      '        </p>\n' +
+      '        <div className="status"><Sparkles size={16} /> Live project mode enabled</div>\n' +
+      '      </section>\n' +
+      '    </main>\n' +
+      '  )\n' +
+      '}\n',
+    'src/styles.css': `:root {
+  color: #f5f2ec;
+  background: #15130f;
+  font-family: ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+.shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  background:
+    linear-gradient(145deg, rgba(245, 242, 236, 0.08), transparent 40%),
+    radial-gradient(circle at 70% 20%, rgba(125, 180, 149, 0.18), transparent 28%),
+    #15130f;
+}
+
+.hero {
+  width: min(720px, 100%);
+}
+
+.eyebrow {
+  margin: 0 0 14px;
+  color: #a8cbb7;
+  font: 700 12px/1.2 ui-sans-serif, system-ui, sans-serif;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+h1 {
+  margin: 0;
+  max-width: 11ch;
+  font-size: clamp(54px, 10vw, 104px);
+  line-height: 0.9;
+  letter-spacing: 0;
+}
+
+.lede {
+  max-width: 620px;
+  margin: 24px 0 0;
+  color: rgba(245, 242, 236, 0.72);
+  font: 18px/1.65 ui-sans-serif, system-ui, sans-serif;
+}
+
+.status {
+  width: fit-content;
+  margin-top: 26px;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: #15130f;
+  background: #a8cbb7;
+  border-radius: 999px;
+  padding: 10px 14px;
+  font: 700 13px/1 ui-sans-serif, system-ui, sans-serif;
+}
+`
+  }
+
+  const written: string[] = []
+  for (const [path, content] of Object.entries(files)) {
+    await wsWriteFile(conversationId, path, content)
+    written.push(path)
+  }
+  return written
+}
+
+function packageName(name: string): string {
+  return (
+    name
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 214) || 'gemma-site'
+  )
+}
+
+type PackageManager = 'npm' | 'pnpm' | 'yarn'
+
+async function detectPackageManager(base: string): Promise<PackageManager> {
+  try {
+    const pkg = JSON.parse(await readFile(join(base, 'package.json'), 'utf-8')) as {
+      packageManager?: string
+    }
+    if (pkg.packageManager?.startsWith('pnpm@')) return 'pnpm'
+    if (pkg.packageManager?.startsWith('yarn@')) return 'yarn'
+  } catch {
+    // Fall through to lockfile detection.
+  }
+
+  try {
+    await access(join(base, 'pnpm-lock.yaml'))
+    return 'pnpm'
+  } catch {
+    // no-op
+  }
+  try {
+    await access(join(base, 'yarn.lock'))
+    return 'yarn'
+  } catch {
+    // no-op
+  }
+  return 'npm'
+}
+
+function assertPackageSpec(spec: string): string {
+  const trimmed = spec.trim()
+  if (!trimmed) throw new Error('Package names cannot be empty.')
+  if (!/^(@[a-z0-9._-]+\/)?[a-z0-9._-]+(@[a-z0-9._~^>=<*-]+)?$/i.test(trimmed)) {
+    throw new Error(`Unsafe package spec: ${spec}`)
+  }
+  return trimmed
+}
+
+export async function wsInstallPackages(
+  conversationId: string,
+  packages: string[] = [],
+  dev = false,
+  timeoutMs = 180_000
+): Promise<BashResult> {
+  const base = await ensureWorkspace(conversationId)
+  await access(join(base, 'package.json'))
+  const manager = await detectPackageManager(base)
+  const safePackages = packages.map(assertPackageSpec)
+
+  const args = (() => {
+    if (manager === 'npm') {
+      if (safePackages.length === 0) return ['install']
+      return ['install', dev ? '--save-dev' : '--save', ...safePackages]
+    }
+    if (manager === 'pnpm') {
+      if (safePackages.length === 0) return ['install']
+      return ['add', dev ? '-D' : '', ...safePackages].filter(Boolean)
+    }
+    if (safePackages.length === 0) return ['install']
+    return ['add', dev ? '--dev' : '', ...safePackages].filter(Boolean)
+  })()
+
+  return runWorkspaceCommand(base, manager, args, timeoutMs, 24_000)
+}
+
+async function runWorkspaceCommand(
+  cwd: string,
+  command: string,
+  args: string[],
+  timeoutMs: number,
+  maxBytes: number
+): Promise<BashResult> {
+  const start = Date.now()
+  return new Promise((resolve) => {
+    const proc = spawn(command, args, {
+      cwd,
+      env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' }
+    })
+    let stdout = ''
+    let stderr = ''
+    let truncated = false
+    const killTimer = setTimeout(() => {
+      proc.kill('SIGKILL')
+      truncated = true
+    }, timeoutMs)
+
+    const append = (current: string, chunk: Buffer, label: string): string => {
+      if (current.length >= maxBytes) return current
+      let next = current + chunk.toString('utf-8')
+      if (next.length >= maxBytes) {
+        next = next.slice(0, maxBytes) + `\n[…${label} truncated]`
+        truncated = true
+      }
+      return next
+    }
+
+    proc.stdout.on('data', (d: Buffer) => {
+      stdout = append(stdout, d, 'output')
+    })
+    proc.stderr.on('data', (d: Buffer) => {
+      stderr = append(stderr, d, 'stderr')
+    })
+    proc.on('close', (code) => {
+      clearTimeout(killTimer)
+      resolve({ exitCode: code, stdout, stderr, truncated, durationMs: Date.now() - start })
+    })
+    proc.on('error', (e) => {
+      clearTimeout(killTimer)
+      resolve({
+        exitCode: -1,
+        stdout,
+        stderr: (stderr + '\n' + String(e)).trim(),
+        truncated,
+        durationMs: Date.now() - start
+      })
+    })
+  })
+}
+
+export async function startWorkspaceDevServer(
+  conversationId: string,
+  script = 'dev'
+): Promise<DevServerStatus> {
+  if (!/^[a-zA-Z0-9:_-]+$/.test(script)) {
+    throw new Error(`Unsafe npm script name: ${script}`)
+  }
+  await stopWorkspaceDevServer(conversationId)
+
+  const base = await ensureWorkspace(conversationId)
+  await access(join(base, 'package.json'))
+  const manager = await detectPackageManager(base)
+  const args = ['run', script, '--', '--host', '127.0.0.1']
+  const command = `${manager} ${args.join(' ')}`
+  const proc = spawn(manager, args, {
+    cwd: base,
+    env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1', BROWSER: 'none' }
+  })
+  const key = devServerKey(conversationId)
+  const managed: ManagedDevServer = {
+    conversationId,
+    command,
+    proc,
+    startedAt: Date.now(),
+    lastOutput: ''
+  }
+  devServers.set(key, managed)
+
+  const appendOutput = (chunk: Buffer): void => {
+    managed.lastOutput = (managed.lastOutput + chunk.toString('utf-8')).slice(-12_000)
+    const url = findLocalUrl(managed.lastOutput)
+    if (url) managed.url = url
+  }
+
+  proc.stdout.on('data', appendOutput)
+  proc.stderr.on('data', appendOutput)
+  proc.on('close', (code) => {
+    managed.exitCode = code
+    if (devServers.get(key) === managed) devServers.delete(key)
+  })
+  proc.on('error', (e) => {
+    managed.exitCode = -1
+    managed.lastOutput = (managed.lastOutput + '\n' + String(e)).trim().slice(-12_000)
+  })
+
+  await new Promise<void>((resolve) => {
+    const started = Date.now()
+    const check = (): void => {
+      if (managed.url || managed.exitCode !== undefined || Date.now() - started > 15_000) {
+        resolve()
+        return
+      }
+      setTimeout(check, 150)
+    }
+    check()
+  })
+
+  return workspaceDevServerStatus(conversationId)
+}
+
+function findLocalUrl(output: string): string | undefined {
+  const matches = output.match(/https?:\/\/(?:localhost|127\.0\.0\.1):\d+\/?/g)
+  if (!matches?.length) return undefined
+  return matches[matches.length - 1].replace('localhost', '127.0.0.1').replace(/\/?$/, '/')
+}
+
+export async function stopWorkspaceDevServer(conversationId: string): Promise<DevServerStatus> {
+  const key = devServerKey(conversationId)
+  const managed = devServers.get(key)
+  if (!managed) return { running: false }
+
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      if (managed.exitCode === undefined) managed.proc.kill('SIGKILL')
+      resolve()
+    }, 2_000)
+    managed.proc.once('close', () => {
+      clearTimeout(timer)
+      resolve()
+    })
+    managed.proc.kill('SIGTERM')
+  })
+  devServers.delete(key)
+  return { running: false, lastOutput: managed.lastOutput, exitCode: managed.exitCode ?? null }
+}
+
+export function workspaceDevServerStatus(conversationId: string): DevServerStatus {
+  const managed = devServers.get(devServerKey(conversationId))
+  if (!managed || managed.exitCode !== undefined) return { running: false }
+  return {
+    running: true,
+    url: managed.url,
+    command: managed.command,
+    pid: managed.proc.pid,
+    startedAt: managed.startedAt,
+    lastOutput: managed.lastOutput
+  }
+}
+
+export async function stopAllWorkspaceDevServers(): Promise<void> {
+  await Promise.all([...devServers.values()].map((s) => stopWorkspaceDevServer(s.conversationId)))
 }
 
 export interface BashResult {

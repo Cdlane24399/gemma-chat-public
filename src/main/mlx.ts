@@ -482,7 +482,7 @@ export async function* chatStream(
 }
 
 /** Parse an SSE byte stream into individual data payloads */
-async function* readSSE(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+export async function* readSSE(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
   const reader = stream.getReader()
   const decoder = new TextDecoder()
   let buf = ''
