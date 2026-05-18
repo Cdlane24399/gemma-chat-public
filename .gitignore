@@ -39,3 +39,4 @@ mlx-venv/
 
 # macOS iconset intermediates (the .icns is tracked)
 build/icon.iconset/
+.ideavo/project
