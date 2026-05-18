@@ -1,0 +1,51 @@
+{
+  "systemSetup": [],
+  "templateName": "custom",
+  "projectDependencies": [
+    {
+      "name": "Install Dependencies",
+      "command": "npm install"
+    }
+  ],
+  "codeChecks": [
+    {
+      "name": "Type Check",
+      "command": "npm run typecheck"
+    }
+  ],
+  "buildSteps": [
+    {
+      "name": "Build Project",
+      "command": "npm run build"
+    }
+  ],
+  "runStep": [
+    {
+      "name": "Run Dev Server",
+      "command": "npm run dev -- --port 3000",
+      "port": "3000"
+    }
+  ],
+  "deploySteps": [
+    {
+      "name": "Package App",
+      "command": "npm run pack"
+    }
+  ],
+  "cleanupFiles": [
+    "dist",
+    "out",
+    "node_modules"
+  ],
+  "packageManager": "npm",
+  "envPaths": [
+    {
+      "name": "default",
+      "path": ".env"
+    },
+    {
+      "name": "local",
+      "path": ".env.local"
+    }
+  ]
+}
